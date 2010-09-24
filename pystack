@@ -1,0 +1,42 @@
+#!/bin/sh
+
+if test $# -ne 1; then
+    echo "Usage: `basename $0 .sh` <process-id>" 1>&2
+    exit 1
+fi
+
+PID=$1
+if test ! -r /proc/$PID; then
+    echo "Process $PID not found." 1>&2
+    exit 1
+fi
+
+# GDB doesn't allow "thread apply all bt" when the process isn't
+# threaded; need to peek at the process to determine if that or the
+# simpler "bt" should be used.
+
+backtrace="pystack"
+if test -d /proc/$PID/task ; then
+    # Newer kernel; has a task/ directory.
+    if test `/bin/ls /proc/$PID/task | /usr/bin/wc -l` -gt 1 2>/dev/null ; then
+	backtrace="thread apply all pystack_thread"
+    fi
+elif test -f /proc/$PID/maps ; then
+    # Older kernel; go by it loading libpthread.
+    if /bin/grep -e libpthread /proc/$PID/maps > /dev/null 2>&1 ; then
+	backtrace="thread apply all pystack_thread"
+    fi
+fi
+
+@ENVIRON@
+GDB=${GDB:-gdb}
+
+# Run GDB, strip out unwanted noise.
+$GDB --quiet -nx /proc/$PID/exe $PID <<EOF 2>&1 | 
+@PYGDBINIT@
+set width 0
+set height 0
+set pagination no
+$backtrace
+EOF
+/bin/sed -n -e 's/^(gdb) //' -e '/^[#=]/p' -e '/^Thread/p'

@@ -1,96 +1,75 @@
-# A rewrite of the Python interpreter's line number calculator in GDB's
-# command language
-define lineno
-   set $__continue = 1
-   set $__co = f->f_code
-   set $__lasti = f->f_lasti
-   set $__sz = ((PyStringObject *)$__co->co_lnotab)->ob_size/2
-   set $__p = (unsigned char *)((PyStringObject *)$__co->co_lnotab)->ob_sval
-   set $__li = $__co->co_firstlineno
-   set $__ad = 0
-   while ($__sz-1 >= 0 && $__continue)
-     set $__sz = $__sz - 1
-     set $__ad = $__ad + *$__p
-     set $__p = $__p + 1
-     if ($__ad > $__lasti)
-	set $__continue = 0
-     end
-     set $__li = $__li + *$__p
-     set $__p = $__p + 1
-   end
-   printf "%d", $__li
-end
-
-set $CALL_FUNCTION = 131
-set $CALL_FLAG_VAR = 2
-set $CALL_FLAG_KW = 1
-
 define pyframe
-  set $__na = (int) next_instr[-2]
-  set $__nkw = (int) next_instr[-1]
-  set $__flags = ((next_instr[-3] - $CALL_FUNCTION) & 3)
-  set $__nstack = $__na + 2 * $__nkw + ($__flags & $CALL_FLAG_VAR ? 1 : 0) + ($__flags & $CALL_FLAG_KW ? 1 : 0)
-  set $__func = stack_pointer[-($__nstack+1)]
   set $__self = (PyObject *) 0
   if ($__func->ob_type == &PyMethod_Type)
     set $__self = (((PyCFunctionObject *)$__func)->m_self)
     set $__func = (((PyCFunctionObject *)$__func)->m_ml->ml_meth)
   end
-  set $__context = (char *)((PyStringObject *)co->co_name)->ob_sval
+  set $__context = (char *)((PyStringObject *)$__co->co_name)->ob_sval
   set $__funcname = PyEval_GetFuncName($__func)
   set $__funcdesc = PyEval_GetFuncDesc($__func)
-  set $__fn = (char *)((PyStringObject *)co->co_filename)->ob_sval
-  printf "== %s > %s%s%s%s at %s:", $__context, \
+  set $__fn = (char *)((PyStringObject *)$__co->co_filename)->ob_sval
+  printf "== %s > %s%s%s%s at %s:%d\n", $__context, \
     ($__self ? $__self->ob_type->tp_name : ""), \
     ($__self ? ":" : ""), $__funcname, $__funcdesc, \
-    $__fn
-  lineno
-  printf "\n"
-## Uncomment these lines when using from within Emacs/XEmacs so it will
-### automatically track/display the current Python source line
-#    printf "%c%c%s:", 032, 032, $__fn
-#    lineno
-#    printf ":1\n"
+    $__fn, PyCode_Addr2Line($__co, $__f->f_lasti)
 end
 
-# Here's a somewhat fragile way to print the entire Python stack from gdb.
-# It's fragile because the tests for the value of $pc depend on the layout
-# of specific functions in the C source code.
-
-# Explanation of while and if tests: We want to pop up the stack until we
-# land in Py_Main (this is probably an incorrect assumption in an embedded
-# interpreter, but the test can be extended by an interested party).  If
-# Py_Main <= $pc <= Py_GetArgcArv is true, $pc is in Py_Main(), so the while
-# tests succeeds as long as it's not true.  In a similar fashion the if
-# statement tests to see if we are in PyEval_EvalFrameEx().
-
-# Note: The name of the main interpreter function and the function which
-# follow it has changed over time.  This version of pystack works with this
-# version of Python.  If you try using it with older or newer versions of
-# the interpreter you may will have to change the functions you compare with
-# $pc.
-
+# Walk the stack from innermost to outermost frame. If we hit a python call
+# frame, extract python caller/callee pair and print it out too. This is
+# *extremely* fragile and likely works with only specific python builds;
+# this script is for python 2.6.8 built for x86-64 with gcc 4.6+.
+#
+# When walking up the call chain, we will first see maybe fast_function,
+# then maybe call_function frame, then PyEval_EvalFrameEx. All three are
+# actually inlined frames inside PyEval_EvalFrameEx, and $rsp remains
+# unchanged even if we walk up the stack. PyEval_EvalCodeEx follows them.
+#
+# Many variables in these call frames are optimised out so we need to wander
+# around the stack to pick out the ones we need: called function 'func' from
+# {call,fast}_function, calling code object 'co' from PyEval_EvalFrameEx and
+# call frame object 'tstate->frame' from PyEval_EvalCodeEx.
+#
+# If and only if we locate all three required parts we dump the python info.
 define pystack_thread
   set $__ctr = 0
-  set $__inlined = 0
   while $__ctr < 200
     frame
-    if $__inlined == 0
-      if ($pc >= PyEval_EvalFrameEx && $pc < PyEval_EvalCodeEx)
-        set $__rsp = $rsp
-        while $pc >= PyEval_EvalFrameEx && $pc < PyEval_EvalCodeEx && $rsp == $__rsp
-	  set $__inlined = $__inlined + 1
+
+    if ($pc >= PyEval_EvalFrameEx && $pc < PyEval_EvalCodeEx)
+      # The first frame we find is fast_function or call_function.
+      # Pick up the 'func' variable here, and remember $rsp so we
+      # can figure how long we're staying inside PyEval_EvalFrameEx.
+      # Then move to the next frame, remembering to print it out.
+      set $__rsp = $rsp
+      set $__func = func
+      up-silently 1
+      frame
+
+      if $pc >= PyEval_EvalFrameEx && $pc < PyEval_EvalCodeEx && $rsp == $__rsp
+        # If the first frame was fast_function, we're now in call_function,
+        # otherwise we've made it to PyEval_EvalFrameEx; step up once more
+        # and see if $rsp changes. If it does, we left to PyEval_EvalCodeEx
+        # and there was no fast_function.
+        up-silently 1
+        frame
+
+        if $pc >= PyEval_EvalFrameEx && $pc < PyEval_EvalCodeEx && $rsp == $__rsp
+          set $__co = co
+          up-silently 1
+          frame
+        else
+          down-silently 1
+          set $__co = co
           up-silently 1
         end
-        down-silently $__inlined
+
+        # We're now at PyEval_EvalCodeEx, print the frame.
+        set $__f = tstate->frame
+        pyframe
       end
     end
-    if $__inlined == 1
-      pyframe
-    end
-    if $__inlined > 0
-      set $__inlined = $__inlined - 1
-    end
+
+    # Quit if it looks like we've come to end of stack.
     if ($pc >= __libc_start_main && $pc < gnu_get_libc_release) || ($pc >= __clone && $pc < __umount)
       loop_break
     end
@@ -98,7 +77,6 @@ define pystack_thread
     set $__ctr = $__ctr + 1
   end
 end
-
 define pystack
-thread apply all pystack_thread
+  thread apply all pystack_thread
 end

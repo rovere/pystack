@@ -29,6 +29,10 @@ end
 # {call,fast}_function, calling code object 'co' from PyEval_EvalFrameEx and
 # call frame object 'tstate->frame' from PyEval_EvalCodeEx.
 #
+# A generator call chain has the usual call_function, PyEval_EvalFrameEx,
+# but then gen_send_ex and PyEval_EvalFrameEx again, with slightly changed
+# meaning from above.
+#
 # If and only if we locate all three required parts we dump the python info.
 define pystack_thread
   set $__ctr = 0
@@ -63,8 +67,20 @@ define pystack_thread
           up-silently 1
         end
 
-        # We're now at PyEval_EvalCodeEx, print the frame.
-        set $__f = tstate->frame
+        # We're now either in gen_send_ex or at PyEval_EvalCodeEx. If the former
+        # record this frame as a generator, get 'f' from it, and fish out the
+        # function object from frame above (PyEval_EvalFrameEx) python stack.
+        # Otherwise in PyEval_EvalCodeEx get frame object from 'tstate->frame'.
+        if $pc >= gen_send_ex && $pc < gen_iternext
+          set $__f = f
+          up-silently 1
+          frame
+          set $__func = stack_pointer[-1]
+        else
+          set $__f = tstate->frame
+        end
+
+        # Print this frame.
         pyframe
       end
     end
